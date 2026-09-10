@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Spawn a direct report: a crewmate in a treehouse or Orca worktree, or a
 # secondmate in its isolated firstmate home.
-# Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>]
-#        fm-spawn.sh <task-id> <project-dir> --scout [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>]
+# Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--harness <name>|harness|launch-command] [--adapter <name>] [--model <name>] [--effort <level>] [--backend <name>]
+#        fm-spawn.sh <task-id> <project-dir> --scout [--harness <name>|harness|launch-command] [--adapter <name>] [--model <name>] [--effort <level>] [--backend <name>]
 #        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] --secondmate
 #   --mode and --yolo are this task's delivery contract, REQUIRED for every ship
 #   spawn and refused on --scout and --secondmate spawns. Firstmate resolves both
@@ -131,6 +131,20 @@
 #   a failed or inconclusive probe omits it so older Pi versions remain launchable.
 #   A missing selected executable refuses before endpoint creation, and pi-signed
 #   never falls back to pi.
+#   --adapter <name> names the verified adapter a RAW launch command actually
+#   runs when the command is a wrapper around that adapter's CLI (sudo, unshare,
+#   setpriv, a container entrypoint). Without it a raw launch records the
+#   command's basename (`sudo`) as harness=, and fm-control then refuses every
+#   verb because that basename has no verified control mechanics. With it the
+#   task records harness=<name> so interrupt/exit/relaunch use that adapter's
+#   verified mechanics, plus launch_basename=<basename> for provenance. It is
+#   accepted only with a raw launch command, must be a verified adapter, and
+#   changes nothing about the launch itself: the wrapper is still the command
+#   that runs, and none of the adapter's in-spawn wiring (trust registration,
+#   busy-state hooks, turn-end hooks) is applied, because the wrapped process
+#   runs under another identity where that wiring would not reach. A relaunch
+#   of such a task reuses the recorded adapter when the replacement is again a
+#   raw launch without --adapter.
 #   For omp (Oh My Pi), fm-spawn resolves the `omp` executable from PATH once and
 #   refuses when it is absent. Every omp launch clears the foreign harness
 #   markers (omp publishes none of its own), sets the Firstmate-owned
@@ -436,6 +450,8 @@ fm_refuse_if_gate_agent
 KIND=ship
 KIND_SET=0
 HARNESS_ARG=
+ADAPTER=
+ADAPTER_SET=0
 MODEL=
 EFFORT=
 BACKEND_ARG=
@@ -459,6 +475,7 @@ for a in "$@"; do
     esac
     case "$want_value" in
       harness) HARNESS_ARG=$a; HARNESS_SET=1 ;;
+      adapter) ADAPTER=$a; ADAPTER_SET=1 ;;
       model) MODEL=$a; MODEL_SET=1 ;;
       effort) EFFORT=$a; EFFORT_SET=1 ;;
       backend) BACKEND_ARG=$a; BACKEND_SET=1 ;;
@@ -476,6 +493,8 @@ for a in "$@"; do
     --relaunch) RELAUNCH=1 ;;
     --harness) want_value=harness ;;
     --harness=*) HARNESS_ARG=${a#--harness=}; HARNESS_SET=1 ;;
+    --adapter) want_value=adapter ;;
+    --adapter=*) ADAPTER=${a#--adapter=}; ADAPTER_SET=1 ;;
     --model) want_value=model ;;
     --model=*) MODEL=${a#--model=}; MODEL_SET=1 ;;
     --effort) want_value=effort ;;
@@ -493,6 +512,11 @@ for a in "$@"; do
 done
 [ -z "$want_value" ] || { echo "error: --$want_value requires a value" >&2; exit 1; }
 [ "$HARNESS_SET" -eq 0 ] || [ -n "$HARNESS_ARG" ] || { echo "error: --harness requires a non-empty value" >&2; exit 1; }
+[ "$ADAPTER_SET" -eq 0 ] || [ -n "$ADAPTER" ] || { echo "error: --adapter requires a non-empty value" >&2; exit 1; }
+if [ -n "$ADAPTER" ] && ! fm_control_harness_supported "$ADAPTER"; then
+  echo "error: --adapter must name a verified adapter (claude, codex, opencode, pi, pi-signed, grok, kimi, cursor, gemini, muse, rovo, omp), not '$ADAPTER'" >&2
+  exit 1
+fi
 [ "$MODEL_SET" -eq 0 ] || [ -n "$MODEL" ] || { echo "error: --model requires a non-empty value" >&2; exit 1; }
 [ "$EFFORT_SET" -eq 0 ] || [ -n "$EFFORT" ] || { echo "error: --effort requires a non-empty value" >&2; exit 1; }
 [ "$BACKEND_SET" -eq 0 ] || [ -n "$BACKEND_ARG" ] || { echo "error: --backend requires a non-empty value" >&2; exit 1; }
@@ -962,7 +986,7 @@ spawn_abort_cleanup() {
             echo "cleanup_recovery=orca"
             echo "worktree=${WT:-}"
             echo "project=$PROJ_ABS"
-            echo "harness=$HARNESS"
+            echo "harness=${META_HARNESS:-$HARNESS}"
             echo "kind=$KIND"
             [ -z "${MODE:-}" ] || echo "mode=$MODE"
             [ -z "${YOLO:-}" ] || echo "yolo=$YOLO"
@@ -1602,6 +1626,31 @@ case "$ARG3" in
     LAUNCH=$(launch_template "$HARNESS" "$KIND") || { echo "error: unknown harness '$HARNESS'; pass a raw launch command to use an unverified adapter" >&2; exit 1; }
     ;;
 esac
+
+# The adapter a raw launch command wraps (--adapter, see the header). It is
+# recorded as the task's harness so fm-control's verified mechanics apply, while
+# $HARNESS stays the command's basename for the rest of this spawn so none of the
+# adapter's in-spawn wiring fires for a process that runs under another identity.
+# A relaunch without --adapter reuses the adapter the task already records, so a
+# harness switch stays a deliberate --harness/--adapter pair rather than a silent
+# regression to the wrapper's basename.
+if [ -n "$ADAPTER" ] && [ "$RAW_LAUNCH" -ne 1 ]; then
+  echo "error: --adapter applies only to a raw launch command (a wrapper around that adapter's CLI); a named adapter already records itself" >&2
+  exit 1
+fi
+if [ -z "$ADAPTER" ] && [ "$RAW_LAUNCH" -eq 1 ] && [ "$RELAUNCH" -eq 1 ]; then
+  prior_adapter=$(fm_meta_get "$RELAUNCH_META" harness)
+  if [ "$prior_adapter" != "$HARNESS" ] && fm_control_harness_supported "$prior_adapter" \
+     && [ -n "$(fm_meta_get "$RELAUNCH_META" launch_basename)" ]; then
+    ADAPTER=$prior_adapter
+  fi
+fi
+META_HARNESS=$HARNESS
+LAUNCH_BASENAME=
+if [ -n "$ADAPTER" ]; then
+  META_HARNESS=$ADAPTER
+  LAUNCH_BASENAME=$HARNESS
+fi
 
 # muse and gemini are verified as CREWMATE/SCOUT adapters only. A secondmate is
 # a firstmate instance, so it needs a primary supervision protocol.
@@ -3552,7 +3601,7 @@ SPAWN_META_PATH=$SPAWN_META_TMP
 preserve_relaunch_meta() {
   awk -F= '
     BEGIN {
-      split("window endpoint_task_id worktree project harness kind mode yolo tasktmp model effort busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx", keys, " ")
+      split("window endpoint_task_id worktree project harness launch_basename kind mode yolo tasktmp model effort busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx", keys, " ")
       for (i in keys) owned[keys[i]] = 1
     }
     !($1 in owned)
@@ -3563,7 +3612,8 @@ preserve_relaunch_meta() {
   echo "endpoint_task_id=$ID"
   echo "worktree=$WT"
   echo "project=$PROJ_ABS"
-  echo "harness=$HARNESS"
+  echo "harness=$META_HARNESS"
+  [ -z "$LAUNCH_BASENAME" ] || echo "launch_basename=$LAUNCH_BASENAME"
   echo "kind=$KIND"
   [ -z "$MODE" ] || echo "mode=$MODE"
   [ -z "$YOLO" ] || echo "yolo=$YOLO"
@@ -3982,4 +4032,4 @@ SPAWN_META_LOCK_HELD=0
 
 SPAWN_DELIVERY=
 [ -z "$MODE" ] || SPAWN_DELIVERY=" mode=$MODE yolo=$YOLO"
-echo "spawned $ID harness=$HARNESS kind=$KIND$SPAWN_DELIVERY window=$META_WINDOW worktree=$WT"
+echo "spawned $ID harness=$META_HARNESS kind=$KIND$SPAWN_DELIVERY window=$META_WINDOW worktree=$WT"
