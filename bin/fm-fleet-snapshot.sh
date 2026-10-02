@@ -1424,6 +1424,12 @@ snapshot_cleanup() {
   cleanup_json_files
 }
 trap snapshot_cleanup EXIT
+# A timeout stops a slow snapshot with TERM. Bash skips the EXIT trap on an
+# untrapped fatal signal, which leaked one fm-fleet-tasks.* dir per stopped run
+# (~9,500 in /tmp by 2026-10-02). Exiting from these traps runs the cleanup.
+trap 'exit 143' TERM
+trap 'exit 130' INT
+trap 'exit 129' HUP
 
 bounded_parent_activities_json() {  # <status-file>
   local f=$1 out rc reason script
