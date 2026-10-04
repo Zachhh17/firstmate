@@ -1076,3 +1076,23 @@ case "$report_out" in
     ;;
 esac
 pass "repeated publication failure is reported at session start until it clears"
+
+# --- orphaned temporaries and the disable switch (One Jarvis, 2026-10-04) ------
+# A refresh the deadline kills before its EXIT trap runs leaves both
+# temporaries behind; a live home leaked ~800 per hour at a 3-second deadline.
+: > "$HOME_DIR/state/.home-summary.json.AbCdEf"
+: > "$HOME_DIR/state/.home-summary-error.XyZ123"
+run_writer "$NOW_THREE" "$EPOCH_THREE" || fail "refresh failed while orphans were present"
+[ ! -e "$HOME_DIR/state/.home-summary.json.AbCdEf" ] \
+  && [ ! -e "$HOME_DIR/state/.home-summary-error.XyZ123" ] \
+  || fail "orphaned refresh temporaries survived the next refresh"
+[ -s "$HOME_DIR/state/home-summary.json" ] || fail "the sweep removed the published ledger"
+pass "the next refresh sweeps temporaries a killed refresh left behind"
+
+before=$(cksum < "$HOME_DIR/state/home-summary.json")
+PATH="$FAKEBIN:$PATH" FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_HOME_SUMMARY_DISABLE=1 \
+  FM_SNAPSHOT_NOW=2026-08-28T10:09:00Z FM_SNAPSHOT_NOW_EPOCH=1787911740 \
+  "$WRITER" --best-effort || fail "a disabled refresh did not exit zero"
+[ "$(cksum < "$HOME_DIR/state/home-summary.json")" = "$before" ] \
+  || fail "a disabled refresh still published"
+pass "FM_HOME_SUMMARY_DISABLE=1 makes the refresh a no-op"

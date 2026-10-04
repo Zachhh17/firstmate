@@ -78,6 +78,13 @@ case "$HOME_SUMMARY_IF_IDLE" in
   *) HOME_SUMMARY_IF_IDLE=0 ;;
 esac
 
+# A home that never reads the ledger (no secondmates; One Jarvis drives crews
+# directly) can turn publication off. Every caller runs it best-effort, so a
+# disabled refresh is a successful no-op and starts no fleet snapshot.
+if [ "${FM_HOME_SUMMARY_DISABLE:-0}" = 1 ] && [ "$HOME_SUMMARY_MODE" != log-failure ]; then
+  exit 0
+fi
+
 if [ "$HOME_SUMMARY_MODE" != parent ]; then
   # shellcheck source=bin/fm-wake-lib.sh
   # shellcheck disable=SC1091
@@ -115,6 +122,12 @@ home_summary_refresh_once() {
     fm_lock_acquire_wait "$REFRESH_LOCK"
   fi
   HOME_SUMMARY_LOCK_HELD=1
+  # Only the lock holder creates temporaries, so any left here belong to an
+  # earlier worker the deadline killed before its EXIT trap ran (bash defers
+  # TERM while the snapshot child runs, and the timeout's KILL follows). Sweep
+  # them, or a home whose refresh keeps timing out leaks two files per attempt.
+  find "$STATE" -maxdepth 1 -type f \( -name '.home-summary.json.??????' \
+    -o -name '.home-summary-error.??????' \) -delete 2>/dev/null || true
   HOME_SUMMARY_TMP=$(umask 077; mktemp "$STATE/.home-summary.json.XXXXXX") || {
     home_summary_fail "could not create an atomic publication file in $STATE"
     return 1
